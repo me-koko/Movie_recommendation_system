@@ -84,20 +84,41 @@ for _, row in movie_titles.iterrows():
 
 print(f"Ready with {len(all_movies)} movies spanning 1922 to 2026!")
 
+def clean_movie_title(raw_title):
+    """Normalizes titles by moving trailing articles and removing extraneous parentheses/dots."""
+    t = str(raw_title).strip()
+    t = re.sub(r'\s*\(\d{4}\)', '', t).strip()
+    if ', The' in t: t = 'The ' + t.replace(', The', '').strip()
+    elif ', A' in t: t = 'A ' + t.replace(', A', '').strip()
+    elif ', An' in t: t = 'An ' + t.replace(', An', '').strip()
+    return t
+
 def fetch_wikipedia_poster(title, year=''):
-    """Fetches high-quality theatrical movie poster from Wikipedia API."""
+    """Fetches high-quality theatrical movie poster from Wikipedia API with smart title resolution."""
     cache_key = f"{title}_{year}"
     if cache_key in POSTER_CACHE:
         return POSTER_CACHE[cache_key]
 
-    queries = []
-    if year:
-        queries.append(f"{title} ({year} film)")
-        queries.append(f"{title} ({year})")
-    queries.append(f"{title} (film)")
-    queries.append(title)
+    clean = clean_movie_title(title)
+    no_paren = re.sub(r'\s*\(.*?\)', '', clean).strip()
+    no_dots = clean.replace('...', '').strip()
+    
+    candidates = [clean]
+    if no_dots != clean:
+        candidates.append(no_dots)
+    if no_paren != clean and len(no_paren) > 2:
+        candidates.append(no_paren)
 
-    headers = {'User-Agent': 'MovieLensRecommender/2.0 (student@edu.org)'}
+    queries = []
+    for c in candidates:
+        if year:
+            queries.append(f"{c} ({year} film)")
+            queries.append(f"{c} ({year})")
+        queries.append(f"{c} (film)")
+        queries.append(f"{c} (movie)")
+        queries.append(c)
+
+    headers = {'User-Agent': 'MovieRecommender/3.0 (student@edu.org)'}
     poster_url = None
 
     for q in queries:
@@ -122,14 +143,16 @@ def warmup_posters():
     starter_movies = [
         ('Star Wars', '1977'),
         ('Toy Story', '1995'),
+        ('The Hangover', '2009'),
+        ('Koi... Mil Gaya', '2003'),
+        ('The Matrix', '1999'),
+        ('Fight Club', '1999'),
         ('Oppenheimer', '2023'),
         ('RRR', '2022'),
-        ('Dune: Part Two', '2024'),
-        ('Inception', '2010'),
         ('The Dark Knight', '2008'),
         ('Fargo', '1996'),
         ('The Godfather', '1972'),
-        ('Parasite', '2019')
+        ('Dilwale Dulhania Le Jayenge', '1995')
     ]
     with ThreadPoolExecutor(max_workers=5) as executor:
         for t, y in starter_movies:
