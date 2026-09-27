@@ -17,7 +17,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATASET_PATH = os.path.join(BASE_DIR, 'dataset.csv')
 TITLES_PATH = os.path.join(BASE_DIR, 'movieIdTitles.csv')
 METADATA_PATH = os.path.join(BASE_DIR, 'movieMetadata.csv')
-RECS_CSV_PATH = os.path.join(BASE_DIR, 'MovieRecommendations.csv')
 
 # In-memory poster cache
 POSTER_CACHE = {}
@@ -41,36 +40,30 @@ def parse_title_and_year(raw_title):
     
     return title, year
 
-# Load and prepare recommendation data
-print("Loading MovieLens dataset, metadata, and correlation matrices...")
+# Load ratings summary for quality/popularity metrics
+print("Loading MovieLens dataset and metadata catalog...")
 column_names = ['user_id', 'item_id', 'rating', 'timestamp']
 df_data = pd.read_csv(DATASET_PATH, sep='\t', names=column_names)
 movie_titles = pd.read_csv(TITLES_PATH)
-df_metadata = pd.read_csv(METADATA_PATH) if os.path.exists(METADATA_PATH) else None
+df_metadata = pd.read_csv(METADATA_PATH)
 
-# Merge historical data for ratings summary and collaborative filtering
 df_merged = pd.merge(df_data, movie_titles, on='item_id')
 ratings_summary = pd.DataFrame(df_merged.groupby('title')['rating'].mean())
 ratings_summary['numOfRatings'] = pd.DataFrame(df_merged.groupby('title')['rating'].count())
-moviemat = df_merged.pivot_table(index='user_id', columns='title', values='rating')
-
-# Precomputed recommendations file (original MovieLens 100k)
-df_precomputed = pd.read_csv(RECS_CSV_PATH).set_index('title')
 
 # Prebuild comprehensive movie catalog (all 1894 movies across 1922-2026)
 all_movies = []
 meta_by_title = {}
-if df_metadata is not None:
-    for _, row in df_metadata.iterrows():
-        meta_by_title[str(row['title']).strip()] = {
-            'genres': str(row.get('genres', 'General')),
-            'industry': str(row.get('industry', 'International'))
-        }
+for _, row in df_metadata.iterrows():
+    meta_by_title[str(row['title']).strip()] = {
+        'genres': str(row.get('genres', 'Drama')),
+        'industry': str(row.get('industry', 'International'))
+    }
 
 for _, row in movie_titles.iterrows():
     raw = str(row['title']).strip()
     t, y = parse_title_and_year(raw)
-    meta = meta_by_title.get(raw, {'genres': 'General', 'industry': 'International'})
+    meta = meta_by_title.get(raw, {'genres': 'Drama', 'industry': 'International'})
     
     has_ratings = raw in ratings_summary.index
     avg_r = round(float(ratings_summary.loc[raw, 'rating']), 2) if has_ratings else None
@@ -144,36 +137,8 @@ def warmup_posters():
 
 threading.Thread(target=warmup_posters, daemon=True).start()
 
-def compute_correlation_recs(movie_raw, offset=0, limit=4):
-    """Computes correlation-based recommendations using Pearson correlation on historical ratings."""
-    if movie_raw in moviemat.columns:
-        user_ratings = moviemat[movie_raw]
-        similarity = moviemat.corrwith(user_ratings)
-        corr_df = pd.DataFrame(similarity, columns=['Correlation']).dropna().join(ratings_summary['numOfRatings'])
-        
-        filtered = corr_df[(corr_df['numOfRatings'] > 100) & (corr_df.index != movie_raw)].sort_values('Correlation', ascending=False)
-        if len(filtered) < limit:
-            filtered = corr_df[(corr_df['numOfRatings'] > 30) & (corr_df.index != movie_raw)].sort_values('Correlation', ascending=False)
-            
-        ranked = filtered.index.tolist()
-        if ranked:
-            total = len(ranked)
-            start = (offset * limit) % total
-            picked = ranked[start:start + limit]
-            if len(picked) < limit and total > len(picked):
-                picked += ranked[:limit - len(picked)]
-            return picked, total
-
-    if movie_raw in df_precomputed.index:
-        row = df_precomputed.loc[movie_raw]
-        rec_cols = ['FirstMovieRecommendation', 'SecondMovieRecommendation', 'ThirdMovieRecommendation', 'FourthMovieRecommendation']
-        recs = [row[c] for c in rec_cols if pd.notna(row[c]) and row[c] != '-']
-        return recs, len(recs)
-
-    return [], 0
-
-def compute_modern_recs(movie_raw, offset=0, limit=4):
-    """For modern movies (2000-2026), recommends related titles using accurate genre and industry affinity."""
+def compute_genre_recommendations(movie_raw, offset=0, limit=4):
+    """Computes pure Content-Based recommendations using multi-genre similarity."""
     target = next((m for m in all_movies if m['raw'] == movie_raw), None)
     if not target:
         return [], 0
@@ -186,26 +151,39 @@ def compute_modern_recs(movie_raw, offset=0, limit=4):
         if m['raw'] == movie_raw:
             continue
         c_genres = set(m['genres'].split('|'))
-        overlap = len(target_genres.intersection(c_genres))
-        ind_match = 1 if m['industry'] == target_ind else 0
+        intersection = target_genres.intersection(c_genres)
+        if not intersection:
+            continue
         
-        # Scoring: genre overlap weighted heavily, same industry bonus, modern era bonus
-        score = overlap * 2.5 + ind_match * 1.0
-        if m['is_modern']:
-            score += 0.5
-        if score > 0:
-            candidates.append((score, m['raw']))
+        # Dice similarity coefficient on genres
+        dice = 2.0 * len(intersection) / (len(target_genres) + len(c_genres))
+        match_pct = int(round(dice * 100))
+        
+        # Tie-breaker score: Dice similarity + subtle quality/industry weighting
+        score = dice
+        if m['industry'] == target_ind:
+            score += 0.05
+        if m['avg_rating']:
+            score += (m['avg_rating'] / 5.0) * 0.03
+            
+        candidates.append({
+            'movie': m,
+            'score': score,
+            'match_pct': match_pct,
+            'matched_genres': list(intersection)
+        })
 
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    all_recs = [c[1] for c in candidates]
-    total = len(all_recs)
+    # Sort primarily by genre similarity score
+    candidates.sort(key=lambda x: x['score'], reverse=True)
+    total = len(candidates)
     if total == 0:
         return [], 0
 
     start = (offset * limit) % total
-    picked = all_recs[start:start + limit]
+    picked = candidates[start:start + limit]
     if len(picked) < limit and total > len(picked):
-        picked += all_recs[:limit - len(picked)]
+        picked += candidates[:limit - len(picked)]
+        
     return picked, total
 
 
@@ -214,7 +192,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Movie Recommendation System (1922–2026)</title>
+    <title>Movie Recommendation System (Genre-Based)</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -375,7 +353,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             color: #ffffff;
         }
 
-        /* Autocomplete Dropdown with Mini Posters */
+        /* Autocomplete Dropdown */
         .suggestions-dropdown {
             position: absolute;
             top: calc(100% + 8px);
@@ -430,15 +408,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         .suggestion-poster-wrap img.loaded { opacity: 1; }
 
-        .suggestion-poster-fallback {
-            position: absolute;
-            color: var(--text-dim);
-            font-size: 0.65rem;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-
         .suggestion-info { flex-grow: 1; min-width: 0; }
 
         .suggestion-title {
@@ -472,13 +441,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             font-weight: 500;
         }
 
-        .modern-chip {
-            background: rgba(56, 189, 248, 0.12);
-            color: var(--accent-cyan);
-            padding: 1px 5px;
-            border-radius: 3px;
-            font-size: 0.72rem;
-            font-weight: 600;
+        .genre-pill {
+            background: rgba(99, 102, 241, 0.12);
+            color: var(--accent-purple);
+            padding: 1px 6px;
+            border-radius: 4px;
+            font-size: 0.74rem;
+            font-weight: 500;
         }
 
         /* Selected Movie Hero Card */
@@ -552,11 +521,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             color: var(--text-muted);
         }
 
-        .selected-meta .rating-star {
-            color: #facc15;
-            display: inline-flex;
-            align-items: center;
-            gap: 3px;
+        .genre-badge-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-top: 6px;
+        }
+
+        .genre-badge {
+            background: rgba(99, 102, 241, 0.18);
+            border: 1px solid rgba(99, 102, 241, 0.3);
+            color: #c7d2fe;
+            padding: 2px 8px;
+            border-radius: 5px;
+            font-size: 0.76rem;
             font-weight: 600;
         }
 
@@ -696,6 +674,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             gap: 8px;
             font-size: 0.82rem;
             color: var(--text-muted);
+            margin-bottom: 4px;
         }
 
         .year-pill {
@@ -706,12 +685,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             font-size: 0.78rem;
         }
 
-        .rating-badge {
-            color: #facc15;
-            display: inline-flex;
-            align-items: center;
-            gap: 3px;
-            font-weight: 500;
+        .match-badge {
+            color: #38bdf8;
+            background: rgba(56, 189, 248, 0.1);
+            border: 1px solid rgba(56, 189, 248, 0.25);
+            padding: 2px 7px;
+            border-radius: 5px;
+            font-weight: 700;
+            font-size: 0.76rem;
+        }
+
+        .card-genres {
+            font-size: 0.78rem;
+            color: var(--text-dim);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
 
         .card-action-cue {
@@ -950,7 +939,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="container">
         <header>
             <h1>Movie Recommendation System</h1>
-            <p>Correlation-based recommender built with Python, Pandas & MovieLens</p>
+            <p>Content-Based Genre Recommender built with Python, Pandas & MovieLens (1922–2026)</p>
             <button type="button" class="stats-trigger-btn" onclick="openStatsModal()">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <line x1="18" y1="20" x2="18" y2="10"></line>
@@ -972,7 +961,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     type="text" 
                     id="movieInput" 
                     class="search-input" 
-                    placeholder="Search movie title or release year (e.g. Oppenheimer, RRR, Star Wars)..." 
+                    placeholder="Search movie title or release year (e.g. Star Wars, Toy Story, Oppenheimer)..." 
                     autocomplete="off"
                     spellcheck="false"
                 >
@@ -1002,44 +991,44 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                         <line x1="17" y1="7" x2="22" y2="7"></line>
                     </svg>
                 </div>
-                <h3>Explore 1,894 Movies (1922 to 2026)</h3>
-                <p>Search any classic or modern title across Hollywood, Bollywood, and International cinema to discover recommendations.</p>
+                <h3>Explore 1,894 Movies by Genre</h3>
+                <p>Select any title from Hollywood, Bollywood, or International cinema to discover recommendations sharing its core genres.</p>
                 
                 <div class="starter-grid">
-                    <div class="starter-card" onclick="selectMovie('Oppenheimer (2023)')">
-                        <div class="starter-poster">
-                            <img id="starter-img-0" alt="Oppenheimer">
-                        </div>
-                        <div class="starter-info">
-                            <div class="starter-title">Oppenheimer</div>
-                            <div class="starter-meta">2023 · Hollywood · Drama</div>
-                        </div>
-                    </div>
-                    <div class="starter-card" onclick="selectMovie('RRR (2022)')">
-                        <div class="starter-poster">
-                            <img id="starter-img-1" alt="RRR">
-                        </div>
-                        <div class="starter-info">
-                            <div class="starter-title">RRR</div>
-                            <div class="starter-meta">2022 · Bollywood · Action</div>
-                        </div>
-                    </div>
                     <div class="starter-card" onclick="selectMovie('Star Wars (1977)')">
                         <div class="starter-poster">
-                            <img id="starter-img-2" alt="Star Wars">
+                            <img id="starter-img-0" alt="Star Wars">
                         </div>
                         <div class="starter-info">
                             <div class="starter-title">Star Wars</div>
-                            <div class="starter-meta">1977 · ⭐ 4.36 (584 ratings)</div>
+                            <div class="starter-meta">1977 · Sci-Fi · Action · Adventure</div>
                         </div>
                     </div>
                     <div class="starter-card" onclick="selectMovie('Toy Story (1995)')">
                         <div class="starter-poster">
-                            <img id="starter-img-3" alt="Toy Story">
+                            <img id="starter-img-1" alt="Toy Story">
                         </div>
                         <div class="starter-info">
                             <div class="starter-title">Toy Story</div>
-                            <div class="starter-meta">1995 · ⭐ 3.88 (452 ratings)</div>
+                            <div class="starter-meta">1995 · Animation · Comedy · Family</div>
+                        </div>
+                    </div>
+                    <div class="starter-card" onclick="selectMovie('Oppenheimer (2023)')">
+                        <div class="starter-poster">
+                            <img id="starter-img-2" alt="Oppenheimer">
+                        </div>
+                        <div class="starter-info">
+                            <div class="starter-title">Oppenheimer</div>
+                            <div class="starter-meta">2023 · Biography · Drama · History</div>
+                        </div>
+                    </div>
+                    <div class="starter-card" onclick="selectMovie('Dark Knight, The (2008)')">
+                        <div class="starter-poster">
+                            <img id="starter-img-3" alt="The Dark Knight">
+                        </div>
+                        <div class="starter-info">
+                            <div class="starter-title">The Dark Knight</div>
+                            <div class="starter-meta">2008 · Action · Crime · Drama</div>
                         </div>
                     </div>
                 </div>
@@ -1048,7 +1037,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <!-- Loading State -->
             <div id="loadingState" style="display: none;">
                 <div class="recommendations-header">
-                    <div class="rec-info-title">Analyzing recommendations...</div>
+                    <div class="rec-info-title">Matching genre fingerprints...</div>
                 </div>
                 <div class="cards-list">
                     <div class="skeleton-card">
@@ -1098,8 +1087,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <h3 id="errorHeading">Unable to Load Recommendations</h3>
                 <p id="errorMessage">Please choose another movie or try again.</p>
                 <div style="margin-top: 18px;">
-                    <button class="refresh-btn" onclick="selectMovie('Oppenheimer (2023)')">Try Oppenheimer</button>
                     <button class="refresh-btn" onclick="selectMovie('Star Wars (1977)')">Try Star Wars</button>
+                    <button class="refresh-btn" onclick="selectMovie('Toy Story (1995)')">Try Toy Story</button>
                 </div>
             </div>
 
@@ -1115,16 +1104,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                         <div id="selectedMovieTitleText" class="selected-title"></div>
                         <div class="selected-meta">
                             <span id="selectedMovieYear" class="year-pill"></span>
-                            <span id="selectedMovieRating" class="rating-star"></span>
                             <span id="selectedMovieMeta"></span>
                         </div>
+                        <div id="selectedMovieGenres" class="genre-badge-list"></div>
                     </div>
                 </div>
 
                 <!-- Recommendations Section Header -->
                 <div class="recommendations-header">
                     <div class="rec-info-title">
-                        Recommended For You <span id="recEngineLabel" class="accent-label">Top Matches</span>
+                        Recommended For You <span id="recEngineLabel" class="accent-label">Top Genre Matches</span>
                     </div>
                     <button type="button" id="refreshBtn" class="refresh-btn" title="Get next set of recommendations">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1181,8 +1170,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         const selectedTag = document.getElementById('selectedTag');
         const selectedMovieTitleText = document.getElementById('selectedMovieTitleText');
         const selectedMovieYear = document.getElementById('selectedMovieYear');
-        const selectedMovieRating = document.getElementById('selectedMovieRating');
         const selectedMovieMeta = document.getElementById('selectedMovieMeta');
+        const selectedMovieGenres = document.getElementById('selectedMovieGenres');
         const selectedMoviePoster = document.getElementById('selectedMoviePoster');
         const recEngineLabel = document.getElementById('recEngineLabel');
 
@@ -1193,10 +1182,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         let suggestionsData = [];
 
         // Load starter posters
-        loadPosterAsync('Oppenheimer', '2023', 'starter-img-0');
-        loadPosterAsync('RRR', '2022', 'starter-img-1');
-        loadPosterAsync('Star Wars', '1977', 'starter-img-2');
-        loadPosterAsync('Toy Story', '1995', 'starter-img-3');
+        loadPosterAsync('Star Wars', '1977', 'starter-img-0');
+        loadPosterAsync('Toy Story', '1995', 'starter-img-1');
+        loadPosterAsync('Oppenheimer', '2023', 'starter-img-2');
+        loadPosterAsync('The Dark Knight', '2008', 'starter-img-3');
 
         // Input listener with debounce
         movieInput.addEventListener('input', () => {
@@ -1286,7 +1275,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                         div.className = 'suggestion-item';
                         const posterId = `sug-poster-${index}`;
                         
-                        let metaText = item.avg_rating ? `⭐ ${item.avg_rating} · ${item.rating_count} reviews` : `${item.industry} · ${item.genres.split('|')[0]}`;
+                        let displayGenres = item.genres.split('|').slice(0, 2).join(' · ');
 
                         div.innerHTML = `
                             <div class="suggestion-poster-wrap">
@@ -1296,8 +1285,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                                 <div class="suggestion-title">${item.title}</div>
                                 <div class="suggestion-sub">
                                     ${item.year ? `<span class="suggestion-year">${item.year}</span>` : ''}
-                                    ${item.is_modern ? `<span class="modern-chip">${item.year >= 2025 ? '2025-26 Release' : '2000s+'}</span>` : ''}
-                                    <span>${metaText}</span>
+                                    <span class="genre-pill">${displayGenres}</span>
+                                    <span>${item.industry}</span>
                                 </div>
                             </div>
                         `;
@@ -1341,7 +1330,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 })
                 .then(data => {
                     if (!data.recommendations || data.recommendations.length === 0) {
-                        showError("Insufficient Correlation Data", `No high-confidence recommendations could be calculated for "${data.movie.title}". Try selecting another title.`);
+                        showError("No Matching Genre Titles", `No movies sharing genres could be found for "${data.movie.title}". Try selecting another title.`);
                         return;
                     }
                     renderRecommendations(data);
@@ -1359,19 +1348,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
             // Selected Movie Card details
             selectedMovieTitleText.textContent = data.movie.title;
-            selectedMovieYear.textContent = data.movie.year || 'MovieLens';
+            selectedMovieYear.textContent = data.movie.year || 'Catalog';
+            selectedTag.textContent = data.movie.year >= 2025 ? 'Upcoming Release' : 'Selected Movie';
+            selectedMovieMeta.textContent = `${data.movie.industry} cinema`;
+            recEngineLabel.textContent = 'Genre Similarity Matches';
 
-            if (data.movie.is_modern) {
-                selectedTag.textContent = data.movie.year >= 2025 ? 'Upcoming / 2026 Release' : 'Modern Release (2000–2026)';
-                selectedMovieRating.innerHTML = '';
-                selectedMovieMeta.textContent = `${data.movie.industry} · ${data.movie.genres.replace(/\\|/g, ' · ')}`;
-                recEngineLabel.textContent = 'Genre & Thematic Matches';
-            } else {
-                selectedTag.textContent = 'Classic MovieLens';
-                selectedMovieRating.innerHTML = `★ ${data.movie.avg_rating} / 5.0`;
-                selectedMovieMeta.textContent = `${data.movie.rating_count} MovieLens reviews`;
-                recEngineLabel.textContent = 'Pearson Correlation Filtering';
-            }
+            // Render selected movie genre badges
+            selectedMovieGenres.innerHTML = '';
+            data.movie.genres.split('|').forEach(g => {
+                const badge = document.createElement('span');
+                badge.className = 'genre-badge';
+                badge.textContent = g;
+                selectedMovieGenres.appendChild(badge);
+            });
 
             selectedMoviePoster.classList.remove('loaded');
             loadPosterAsync(data.movie.title, data.movie.year, 'selectedMoviePoster');
@@ -1387,7 +1376,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 card.title = `Click to get recommendations for ${rec.title}`;
 
                 const cardId = `poster-${idx}`;
-                let metaText = rec.avg_rating ? `<span class="rating-badge">★ ${rec.avg_rating}</span> <span>(${rec.rating_count} reviews)</span>` : `<span>${rec.industry || 'Catalog'} · ${rec.genres ? rec.genres.split('|')[0] : 'Feature'}</span>`;
+                const genresFormatted = rec.genres ? rec.genres.replace(/\\|/g, ' · ') : 'General';
 
                 card.innerHTML = `
                     <div class="card-rank">#${idx + 1}</div>
@@ -1398,8 +1387,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                         <div class="card-title">${rec.title}</div>
                         <div class="card-meta">
                             ${rec.year ? `<span class="year-pill">${rec.year}</span>` : ''}
-                            ${metaText}
+                            <span class="match-badge">${rec.match_pct}% Match</span>
+                            <span>${rec.industry || 'Cinema'}</span>
                         </div>
+                        <div class="card-genres">${genresFormatted}</div>
                     </div>
                     <div class="card-action-cue">
                         <span>Explore</span>
@@ -1472,7 +1463,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                         `;
                         tbody.appendChild(tr);
                     });
-                    // Total row
                     const totalTr = document.createElement('tr');
                     totalTr.style.borderTop = '2px solid rgba(255,255,255,0.15)';
                     totalTr.style.fontWeight = '700';
@@ -1552,33 +1542,15 @@ def recommend():
     if not target:
         return jsonify({'error': 'Movie not found in dataset', 'recommendations': []}), 404
 
-    target_raw = target['raw']
-    target_title = target['title']
-    target_year = target['year']
-
-    # Handle recommendation based on whether it is a historical or modern movie
-    if not target['is_modern'] and target_raw in moviemat.columns:
-        rec_raws, total_count = compute_correlation_recs(target_raw, offset=offset, limit=limit)
-    else:
-        rec_raws, total_count = compute_modern_recs(target_raw, offset=offset, limit=limit)
-
+    # Pure Content-Based Genre Recommendations
+    rec_results, total_count = compute_genre_recommendations(target['raw'], offset=offset, limit=limit)
+    
     formatted_recs = []
-    for r in rec_raws:
-        match_item = next((m for m in all_movies if m['raw'] == r), None)
-        if match_item:
-            formatted_recs.append(match_item)
-        else:
-            t, y = parse_title_and_year(r)
-            formatted_recs.append({
-                'raw': r,
-                'title': t,
-                'year': y,
-                'genres': 'General',
-                'industry': 'Catalog',
-                'avg_rating': None,
-                'rating_count': 0,
-                'is_modern': False
-            })
+    for r in rec_results:
+        m = r['movie'].copy()
+        m['match_pct'] = r['match_pct']
+        m['matched_genres'] = r['matched_genres']
+        formatted_recs.append(m)
 
     return jsonify({
         'movie': target,
@@ -1619,7 +1591,7 @@ def dataset_stats():
 if __name__ == '__main__':
     port = 5000
     print("=" * 65)
-    print(" Movie Recommendation System (Expanded 1922-2026)")
+    print(" Movie Recommendation System (Genre-Based)")
     print(f" Web app running at: http://127.0.0.1:{port}")
     print("=" * 65)
     app.run(host='127.0.0.1', port=port, debug=False)
